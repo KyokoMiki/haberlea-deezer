@@ -1,0 +1,18 @@
+[build-system]
+requires = ["uv_build"]
+build-backend = "uv_build"
+
+[project]
+name = "haberlea-deezer"
+version = "0.1.0"
+description = "Deezer module for Haberlea"
+requires-python = ">=3.11"
+dependencies = [
+    "aiofiles>=25.1.0",
+    "aiohttp>=3.13.2",
+    "msgspec>=0.20.0",
+    "pycryptodomex>=3.23.0",
+]
+
+[project.entry-points."haberlea.modules"]
+deezer = "haberlea_deezer:module_information"
