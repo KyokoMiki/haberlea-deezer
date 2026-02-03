@@ -4,8 +4,7 @@ This module provides async API access to Deezer's music streaming service,
 handling authentication, track metadata, and encrypted stream downloads.
 """
 
-import asyncio
-import os
+from collections.abc import Callable
 from hashlib import md5
 from math import ceil
 from random import randint
@@ -549,6 +548,53 @@ class DeezerApi:
         )
         return key
 
+    def _create_blowfish_decryptor(
+        self, bf_key: bytes, chunk_size: int = 1048576
+    ) -> Callable[[bytes, int], bytes]:
+        """Create a chunk processor for Blowfish CBC decryption.
+
+        Deezer encrypts every third 2048-byte block with Blowfish CBC.
+
+        Args:
+            bf_key: 16-byte Blowfish decryption key.
+            chunk_size: Chunk size in bytes (must match download_file chunk_size
+                and be a multiple of 2048). Defaults to 1 MiB (1048576 bytes).
+
+        Returns:
+            A chunk processor function for use with download_file.
+
+        Raises:
+            ValueError: If chunk_size is not a multiple of 2048.
+        """
+        block_size = 2048
+        if chunk_size % block_size != 0:
+            raise ValueError(
+                f"chunk_size must be a multiple of {block_size}, got {chunk_size}"
+            )
+
+        iv = b"\x00\x01\x02\x03\x04\x05\x06\x07"
+        blocks_per_chunk = chunk_size // block_size
+
+        def process_chunk(chunk: bytes, chunk_index: int) -> bytes:
+            result = bytearray()
+            # Starting block index for this chunk
+            base_block_index = chunk_index * blocks_per_chunk
+
+            for i in range(0, len(chunk), block_size):
+                block = chunk[i : i + block_size]
+                block_index = base_block_index + (i // block_size)
+
+                # Decrypt every third block (index 0, 3, 6, ...)
+                if block_index % 3 == 0 and len(block) == block_size:
+                    cipher = Blowfish.new(bf_key, Blowfish.MODE_CBC, iv)
+                    block = cipher.decrypt(block)
+
+                result.extend(block)
+
+            return bytes(result)
+
+        return process_chunk
+
     async def download_and_decrypt_track(
         self,
         track_id: str,
@@ -556,10 +602,10 @@ class DeezerApi:
         output_path: str,
         session: aiohttp.ClientSession | None = None,
     ) -> None:
-        """Download and decrypt a Deezer track.
+        """Download and decrypt a Deezer track with streaming decryption.
 
-        Downloads the encrypted file using download_file for progress reporting,
-        then decrypts it using Blowfish CBC (every third 2048-byte chunk).
+        Decrypts the track during download using Blowfish CBC
+        (every third 2048-byte block), avoiding temporary files.
 
         Args:
             track_id: Track identifier for key generation.
@@ -567,40 +613,14 @@ class DeezerApi:
             output_path: Path to save decrypted file.
             session: Optional aiohttp session to reuse.
         """
-        # Download encrypted file with progress reporting
-        temp_path = output_path + ".encrypted"
-        await download_file(url, temp_path, session=session)
-
-        # Decrypt in thread pool to avoid blocking
+        chunk_size = 1048576
         bf_key = self.get_blowfish_key(track_id)
-        await asyncio.to_thread(self._decrypt_track, temp_path, output_path, bf_key)
+        chunk_processor = self._create_blowfish_decryptor(bf_key, chunk_size)
 
-        # Remove temp file
-        os.remove(temp_path)
-
-    def _decrypt_track(self, input_path: str, output_path: str, bf_key: bytes) -> None:
-        """Decrypt a Deezer track file.
-
-        Deezer uses Blowfish CBC encryption on every third 2048-byte chunk.
-
-        Args:
-            input_path: Path to encrypted file.
-            output_path: Path to save decrypted file.
-            bf_key: 16-byte Blowfish key.
-        """
-        iv = b"\x00\x01\x02\x03\x04\x05\x06\x07"
-
-        with open(input_path, "rb") as f_in, open(output_path, "wb") as f_out:
-            chunk_index = 0
-            while True:
-                chunk = f_in.read(2048)
-                if not chunk:
-                    break
-
-                # Decrypt every third chunk (index 0, 3, 6, ...)
-                if chunk_index % 3 == 0 and len(chunk) == 2048:
-                    cipher = Blowfish.new(bf_key, Blowfish.MODE_CBC, iv)
-                    chunk = cipher.decrypt(chunk)
-
-                f_out.write(chunk)
-                chunk_index += 1
+        await download_file(
+            url,
+            output_path,
+            session=session,
+            chunk_processor=chunk_processor,
+            chunk_size=chunk_size,
+        )
