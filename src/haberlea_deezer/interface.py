@@ -5,12 +5,13 @@ supporting MP3 and FLAC formats with Blowfish decryption.
 """
 
 import contextlib
+import logging
 import re
 from enum import Enum, auto
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from rich import print
 from yarl import URL
 
 from haberlea.plugins.base import ModuleBase
@@ -20,7 +21,6 @@ from haberlea.utils.models import (
     ArtistInfo,
     CodecEnum,
     CodecOptions,
-    CoverCompressionEnum,
     CoverInfo,
     CoverOptions,
     CreditsInfo,
@@ -41,6 +41,9 @@ from haberlea.utils.models import (
 )
 
 from .deezer_api import DeezerApi
+from .results import ImageRequest, TrackAvailability, TrackCodecInfo
+
+logger = logging.getLogger(__name__)
 
 module_information = ModuleInformation(
     service_name="Deezer",
@@ -51,6 +54,8 @@ module_information = ModuleInformation(
         | ModuleModes.credits
     ),
     global_settings={
+        "name": "",
+        "region": "",
         "client_id": "447462",
         "client_secret": "a83bf7f38ad2f137e444727cfc3775cf",
         "bf_secret": "g4el58wc0zvf9na1",
@@ -97,9 +102,6 @@ class ModuleInterface(ModuleBase):
         self.settings = module_controller.module_settings
         self.tsc = module_controller.temporary_settings_controller
         self.cover_options = module_controller.haberlea_options.default_cover_options
-        self.disable_subscription_check = (
-            module_controller.haberlea_options.disable_subscription_check
-        )
 
         # Deezer doesn't support webp
         if self.cover_options.file_type is ImageFileTypeEnum.webp:
@@ -134,11 +136,6 @@ class ModuleInterface(ModuleBase):
             QualityEnum.HIFI: "FLAC",
         }
 
-        self.compression_map: dict[CoverCompressionEnum, int] = {
-            CoverCompressionEnum.high: 80,
-            CoverCompressionEnum.low: 50,
-        }
-
         self.quality_tier = module_controller.haberlea_options.quality_tier
         self.target_format = self.quality_map[self.quality_tier]
 
@@ -163,11 +160,13 @@ class ModuleInterface(ModuleBase):
                 await self.api.login_via_arl(arl)
             except ModuleAuthError:
                 if email and password:
-                    arl, _ = await self.api.login_via_email(email, password)
+                    result = await self.api.login_via_email(email, password)
+                    arl = result.arl
                 else:
                     raise
         elif email and password:
-            arl, _ = await self.api.login_via_email(email, password)
+            result = await self.api.login_via_email(email, password)
+            arl = result.arl
         else:
             raise ModuleAuthError(module_name="deezer")
 
@@ -176,14 +175,12 @@ class ModuleInterface(ModuleBase):
 
     def _check_subscription(self) -> None:
         """Check if target format is available with current subscription."""
-        if self.disable_subscription_check:
-            return
-
         if self.target_format not in self.api.available_formats:
-            available = ", ".join(self.api.available_formats)
-            print(
-                f"Deezer: {self.target_format} is not available with your "
-                f"subscription. Available formats: {available}"
+            logger.warning(
+                "Deezer: %s is not available with your subscription."
+                " Available formats: %s",
+                self.target_format,
+                ", ".join(self.api.available_formats),
             )
 
     def custom_url_parse(self, url: str) -> MediaIdentification:
@@ -222,36 +219,27 @@ class ModuleInterface(ModuleBase):
             original_url=url,
         )
 
-    def _get_image_url(
-        self,
-        md5_hash: str,
-        img_type: ImageType,
-        file_type: ImageFileTypeEnum,
-        resolution: int,
-        compression: int,
-    ) -> str:
+    def _get_image_url(self, request: ImageRequest) -> str:
         """Generate Deezer CDN image URL.
 
         Args:
-            md5_hash: Image MD5 hash identifier.
-            img_type: Type of image (cover, artist, etc.).
-            file_type: Image file format.
-            resolution: Image resolution in pixels.
-            compression: JPEG compression quality.
+            request: Image request parameters.
 
         Returns:
             CDN image URL string.
         """
-        if resolution > 3000:
-            resolution = 3000
+        resolution = min(request.resolution, 3000)
 
-        if file_type == ImageFileTypeEnum.jpg:
-            filename = f"{resolution}x0-000000-{compression}-0-0.jpg"
+        # Always request uncompressed (quality=100) from CDN; any compression
+        # is handled locally by the core's _process_artwork per main_compression.
+        if request.file_type == ImageFileTypeEnum.jpg:
+            filename = f"{resolution}x0-000000-100-0-0.jpg"
         else:
             filename = f"{resolution}x0-none-100-0-0.png"
 
         return (
-            f"https://cdn-images.dzcdn.net/images/{img_type.name}/{md5_hash}/{filename}"
+            f"https://cdn-images.dzcdn.net/images/"
+            f"{request.img_type}/{request.md5_hash}/{filename}"
         )
 
     async def _get_track_data(
@@ -302,7 +290,7 @@ class ModuleInterface(ModuleBase):
 
     def _check_track_availability(
         self, t_data: dict[str, Any], audio_format: str, is_user_uploaded: bool
-    ) -> tuple[str, str | None]:
+    ) -> TrackAvailability:
         """Check track availability and determine format.
 
         Args:
@@ -311,7 +299,7 @@ class ModuleInterface(ModuleBase):
             is_user_uploaded: Whether track is user-uploaded.
 
         Returns:
-            Tuple of (final_format, error_message).
+            TrackAvailability with final format and optional error message.
         """
         error: str | None = None
 
@@ -319,7 +307,7 @@ class ModuleInterface(ModuleBase):
             rights = t_data.get("RIGHTS", {})
             if not rights.get("STREAM_ADS_AVAILABLE"):
                 error = "Cannot download track uploaded by another user"
-            return audio_format, error
+            return TrackAvailability(audio_format=audio_format, fallback_id=error)
 
         # Find best available format
         available_format = self._find_available_format(t_data, audio_format)
@@ -332,7 +320,7 @@ class ModuleInterface(ModuleBase):
         elif final_format not in self.api.available_formats:
             error = f"Format {final_format} not available with your subscription"
 
-        return final_format, error
+        return TrackAvailability(audio_format=final_format, fallback_id=error)
 
     def _get_track_artists(self, t_data: dict[str, Any]) -> list[str]:
         """Extract artist names from track data.
@@ -347,16 +335,14 @@ class ModuleInterface(ModuleBase):
             return [a["ART_NAME"] for a in t_data["ARTISTS"]]
         return [t_data.get("ART_NAME", "Unknown")]
 
-    def _calculate_track_codec_bitrate(
-        self, audio_format: str
-    ) -> tuple[CodecEnum, int | None]:
+    def _calculate_track_codec_bitrate(self, audio_format: str) -> TrackCodecInfo:
         """Determine codec and bitrate from audio format.
 
         Args:
             audio_format: Audio format string.
 
         Returns:
-            Tuple of (codec, bitrate).
+            TrackCodecInfo with codec and bitrate.
         """
         codec_map = {
             "MP3_MISC": CodecEnum.MP3,
@@ -374,7 +360,7 @@ class ModuleInterface(ModuleBase):
         }
         bitrate = bitrate_map.get(audio_format)
 
-        return codec, bitrate
+        return TrackCodecInfo(codec=codec, bitrate=bitrate)
 
     async def get_track_info(
         self,
@@ -409,12 +395,16 @@ class ModuleInterface(ModuleBase):
         tags = self._build_track_tags(t_data)
 
         # Check availability and determine format
-        audio_format, error = self._check_track_availability(
+        availability = self._check_track_availability(
             t_data, audio_format, is_user_uploaded
         )
+        audio_format = availability.audio_format
+        error = availability.fallback_id
 
         # Map format to codec and bitrate
-        codec, bitrate = self._calculate_track_codec_bitrate(audio_format)
+        codec_info = self._calculate_track_codec_bitrate(audio_format)
+        codec = codec_info.codec
+        bitrate = codec_info.bitrate
 
         # Build track name
         track_name = t_data.get("SNG_TITLE", "")
@@ -426,11 +416,12 @@ class ModuleInterface(ModuleBase):
 
         # Cover URL
         cover_url = self._get_image_url(
-            t_data.get("ALB_PICTURE", ""),
-            ImageType.cover,
-            ImageFileTypeEnum.jpg,
-            self.cover_options.resolution,
-            self.compression_map[self.cover_options.compression],
+            ImageRequest(
+                md5_hash=t_data.get("ALB_PICTURE", ""),
+                img_type=ImageType.cover.name,
+                file_type=ImageFileTypeEnum.jpg,
+                resolution=self.cover_options.resolution,
+            )
         )
 
         # Release year
@@ -499,7 +490,7 @@ class ModuleInterface(ModuleBase):
 
     async def get_track_download(
         self,
-        target_path: str,
+        target_path: Path,
         url: str = "",
         data: dict[str, Any] | None = None,
     ) -> TrackDownloadInfo:
@@ -577,11 +568,12 @@ class ModuleInterface(ModuleBase):
 
         # Cover URL
         cover_url = self._get_image_url(
-            a_data.get("ALB_PICTURE", ""),
-            ImageType.cover,
-            cover_type,
-            self.cover_options.resolution,
-            self.compression_map[self.cover_options.compression],
+            ImageRequest(
+                md5_hash=a_data.get("ALB_PICTURE", ""),
+                img_type=ImageType.cover.name,
+                file_type=cover_type,
+                resolution=self.cover_options.resolution,
+            )
         )
 
         # Build track data for passing to get_track_info
@@ -656,11 +648,12 @@ class ModuleInterface(ModuleBase):
 
         # Cover URL
         cover_url = self._get_image_url(
-            p_data.get("PLAYLIST_PICTURE", ""),
-            ImageType.playlist,
-            cover_type,
-            self.cover_options.resolution,
-            self.compression_map[self.cover_options.compression],
+            ImageRequest(
+                md5_hash=p_data.get("PLAYLIST_PICTURE", ""),
+                img_type=ImageType.playlist.name,
+                file_type=cover_type,
+                resolution=self.cover_options.resolution,
+            )
         )
 
         return PlaylistInfo(
@@ -753,11 +746,12 @@ class ModuleInterface(ModuleBase):
             file_type = ImageFileTypeEnum.jpg
 
         url = self._get_image_url(
-            cover_md5,
-            ImageType.cover,
-            file_type,
-            cover_options.resolution,
-            self.compression_map[cover_options.compression],
+            ImageRequest(
+                md5_hash=cover_md5,
+                img_type=ImageType.cover.name,
+                file_type=file_type,
+                resolution=cover_options.resolution,
+            )
         )
 
         return CoverInfo(url=url, file_type=file_type)
@@ -832,7 +826,7 @@ class ModuleInterface(ModuleBase):
                 isrc_result = await self.api.get_track_by_isrc(track_info.tags.isrc)
                 results = [isrc_result]
             except Exception as e:
-                print(f"ISRC search failed: {e}")
+                logger.warning("ISRC search failed: %s", e)
 
         if not results:
             search_data = await self.api.search(query, query_type.name, 0, limit)

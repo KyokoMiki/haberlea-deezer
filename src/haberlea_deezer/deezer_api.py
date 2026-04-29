@@ -7,6 +7,7 @@ handling authentication, track metadata, and encrypted stream downloads.
 from collections.abc import Callable
 from hashlib import md5
 from math import ceil
+from pathlib import Path
 from random import randint
 from time import time
 from typing import Any
@@ -18,7 +19,9 @@ from Cryptodome.Hash import MD5
 from yarl import URL
 
 from haberlea.utils.exceptions import ModuleAPIError, ModuleAuthError
-from haberlea.utils.utils import create_aiohttp_session, download_file
+from haberlea.utils.utils import DownloadConfig, create_aiohttp_session, download_file
+
+from .results import LoginResult
 
 
 class DeezerApiError(msgspec.Struct):
@@ -218,9 +221,7 @@ class DeezerApi:
 
         return user_data
 
-    async def login_via_email(
-        self, email: str, password: str
-    ) -> tuple[str, dict[str, Any]]:
+    async def login_via_email(self, email: str, password: str) -> LoginResult:
         """Authenticate using email and password.
 
         Args:
@@ -228,7 +229,7 @@ class DeezerApi:
             password: User password.
 
         Returns:
-            Tuple of (ARL token, user data dictionary).
+            LoginResult with ARL token and user data.
 
         Raises:
             ModuleAuthError: If authentication fails.
@@ -261,7 +262,7 @@ class DeezerApi:
         arl_token: str = str(arl_result)
         user_data = await self.login_via_arl(arl_token)
 
-        return arl_token, user_data
+        return LoginResult(arl=arl_token, user_data=user_data)
 
     async def get_track(self, track_id: str) -> dict[str, Any]:
         """Get track metadata from pageTrack endpoint.
@@ -599,7 +600,7 @@ class DeezerApi:
         self,
         track_id: str,
         url: str,
-        output_path: str,
+        output_path: Path,
         session: aiohttp.ClientSession | None = None,
     ) -> None:
         """Download and decrypt a Deezer track with streaming decryption.
@@ -620,7 +621,9 @@ class DeezerApi:
         await download_file(
             url,
             output_path,
+            config=DownloadConfig(
+                chunk_processor=chunk_processor,
+                chunk_size=chunk_size,
+            ),
             session=session,
-            chunk_processor=chunk_processor,
-            chunk_size=chunk_size,
         )
